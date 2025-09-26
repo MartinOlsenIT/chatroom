@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Admin Panel</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body class="admin-page">
+  <div class="admin-container">
+    <h2>Admin Panel</h2>
+    <button id="back">⬅ Back to Chat</button>
+    <div id="users-list"></div>
+  </div>
+
+  <script type="module">
+    import { auth, db } from "./js/firebase-config.js";
+    import { collection, getDocs, updateDoc, doc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+    document.getElementById("back").addEventListener("click", () => {
+      window.location = "index.html";
+    });
+
+    onAuthStateChanged(auth, async (user) => {
+      if (!user) return (window.location = "login.html");
+
+      const usersCol = collection(db, "users");
+      const snap = await getDocs(usersCol);
+
+      const list = document.getElementById("users-list");
+      list.innerHTML = "";
+
+      snap.forEach((docSnap) => {
+        const data = docSnap.data();
+        const row = document.createElement("div");
+        row.className = "admin-user-row";
+        row.innerHTML = `
+          <div>
+            <strong>${data.username}</strong> (${data.email})<br/>
+            Role: ${data.role} | Banned: ${data.banned}
+          </div>
+          <div>
+            <button class="make-admin">Make Admin</button>
+            <button class="toggle-ban">${data.banned ? "Unban" : "Ban"}</button>
+          </div>
+        `;
+
+        row.querySelector(".make-admin").addEventListener("click", async () => {
+          await updateDoc(doc(db, "users", data.uid), { role: "admin" });
+          alert(`${data.username} is now admin!`);
+          window.location.reload();
+        });
+
+        row.querySelector(".toggle-ban").addEventListener("click", async () => {
+          await updateDoc(doc(db, "users", data.uid), { banned: !data.banned });
+          alert(`${data.username} ban status changed!`);
+          window.location.reload();
+        });
+
+        list.appendChild(row);
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Login / Signup</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body class="auth-page">
+  <div class="auth-container">
+    <h2>Login</h2>
+    <form id="login-form">
+      <input type="email" id="email" placeholder="Email" required />
+      <input type="password" id="password" placeholder="Password" required />
+      <button type="submit">Login</button>
+    </form>
+
+    <hr />
+
+    <h3>Sign Up</h3>
+    <form id="signup-form">
+      <input type="text" id="username" placeholder="Username" required />
+      <input type="email" id="signup-email" placeholder="Email" required />
+      <input type="password" id="signup-password" placeholder="Password" required />
+      <button type="submit">Sign Up</button>
+    </form>
+  </div>
+
+  <script type="module">
+    import { login, signup } from "./js/auth.js";
+
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        await login(
+          document.getElementById("email").value,
+          document.getElementById("password").value
+        );
+        // onAuthStateChanged will redirect
+      } catch (err) {
+        alert("Login failed: " + err.message);
+      }
+    });
+
+    document.getElementById("signup-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      try {
+        await signup(
+          document.getElementById("signup-email").value,
+          document.getElementById("signup-password").value,
+          document.getElementById("username").value
+        );
+        // onAuthStateChanged will redirect
+      } catch (err) {
+        alert("Signup failed: " + err.message);
+      }
+    });
+  </script>
+</body>
+</html>

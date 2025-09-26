@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>My Profile</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body class="profile-page">
+  <div class="profile-container">
+    <h2>My Profile</h2>
+    <form id="profile-form">
+      <input type="text" id="username" placeholder="Username" required />
+      <textarea id="bio" placeholder="Your bio..."></textarea>
+      <button type="submit">Save</button>
+    </form>
+    <button id="back">⬅ Back to Chat</button>
+  </div>
+
+  <script type="module">
+    import { auth, db } from "./js/firebase-config.js";
+    import { doc, getDoc, updateDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+    const form = document.getElementById("profile-form");
+    const usernameInput = document.getElementById("username");
+    const bioInput = document.getElementById("bio");
+
+    onAuthStateChanged(auth, async (user) => {
+      if (!user) return (window.location = "login.html");
+
+      const snap = await getDoc(doc(db, "users", user.uid));
+      if (snap.exists()) {
+        usernameInput.value = snap.data().username || "";
+        bioInput.value = snap.data().bio || "";
+      }
+    });
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const user = auth.currentUser;
+      if (!user) return;
+
+      await updateDoc(doc(db, "users", user.uid), {
+        username: usernameInput.value,
+        bio: bioInput.value
+      });
+
+      alert("Profile updated!");
+    });
+
+    document.getElementById("back").addEventListener("click", () => {
+      window.location = "index.html";
+    });
+  </script>
+</body>
+</html>

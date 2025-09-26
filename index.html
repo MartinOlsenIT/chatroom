@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Chatroom</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <header>
+    <h2>🔥 Chatroom</h2>
+    <div>
+      <button id="profile">My Profile</button>
+      <button id="admin">Admin Panel</button>
+      <button id="logout">Logout</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="chat-box" class="chat-box"></div>
+
+    <form id="message-form" class="message-form">
+      <input id="message-input" placeholder="Type a message..." autocomplete="off" required />
+      <button type="submit">Send</button>
+    </form>
+  </main>
+
+  <script type="module">
+    import { logout } from "./js/auth.js";
+    import "./js/chat.js";
+    import { auth, db } from "./js/firebase-config.js";
+    import { doc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+    // logout button
+    document.getElementById("logout").addEventListener("click", async () => {
+      await logout();
+      window.location = "login.html";
+    });
+
+    // profile button
+    document.getElementById("profile").addEventListener("click", () => {
+      window.location = "profile.html";
+    });
+
+    // admin button (only show if user is admin)
+    const adminBtn = document.getElementById("admin");
+    onAuthStateChanged(auth, async (user) => {
+      if (!user) return;
+      const snap = await getDoc(doc(db, "users", user.uid));
+      if (snap.exists() && snap.data().role === "admin") {
+        adminBtn.style.display = "inline-block";
+        adminBtn.addEventListener("click", () => {
+          window.location = "admin.html";
+        });
+      } else {
+        adminBtn.style.display = "none"; // hide if not admin
+      }
+    });
+  </script>
+</body>
+</html>
