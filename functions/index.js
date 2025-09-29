@@ -1,206 +1,247 @@
 // functions/index.js
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
-const corsLib = require("cors");
-const cors = corsLib({ origin: true });
+const cors = require("cors")({ origin: true });
 
 admin.initializeApp();
 const db = admin.firestore();
 
-function roleLevel(role){
-  if (!role) return 0;
-  if (role === "GrandWizard") return 3;
-  if (role === "admin") return 2;
-  if (role === "moderator") return 1;
-  return 0;
-}
-
-async function getCallerUidFromReq(req){
+// Helper: check Authorization header Bearer <ID_TOKEN> and required role
+async function checkAuth(req, res, requiredRole = "admin") {
   const authHeader = req.headers.authorization || "";
-  if (!authHeader.startsWith("Bearer ")) {
-    throw { status: 401, message: "Missing Authorization Bearer token" };
+  const token = authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+  if (!token) throw new Error("Missing auth token");
+
+  const decoded = await admin.auth().verifyIdToken(token);
+  const userDocSnap = await db.collection("users").doc(decoded.uid).get();
+  const role = userDocSnap.exists ? userDocSnap.data().role : "user";
+
+  // GrandWizard can do everything
+  if (role === "GrandWizard") return { uid: decoded.uid, role };
+
+  // If requiredRole is GrandWizard only, block others
+  if (requiredRole === "GrandWizard") {
+    throw new Error("Not authorized: GrandWizard required");
   }
-  const idToken = authHeader.split("Bearer ")[1];
-  const decoded = await admin.auth().verifyIdToken(idToken);
-  return decoded.uid;
-}
-async function getUserRole(uid){
-  const snap = await db.doc(`users/${uid}`).get();
-  if (!snap.exists) return null;
-  return snap.data().role || "user";
+
+  // Admin or exact match requiredRole
+  if (role === requiredRole || role === "admin") {
+    return { uid: decoded.uid, role };
+  }
+
+  throw new Error("Not authorized");
 }
 
-// delete docs in batches (limit 500)
-async function deleteQueryBatch(q){
-  const snapshot = await q.get();
-  if (snapshot.empty) return 0;
-  const batch = db.batch();
-  snapshot.docs.forEach(doc => batch.delete(doc.ref));
-  await batch.commit();
-  return snapshot.size;
+// Utility: write audit log
+async function moderationLog(action, targetUid, byUid, meta = {}) {
+  try {
+    await db.collection("moderationLogs").add({
+      action,
+      targetUid,
+      by: byUid || null,
+      ts: admin.firestore.FieldValue.serverTimestamp(),
+      meta
+    });
+  } catch (e) {
+    console.error("Failed to write moderation log", e);
+  }
 }
 
-// HTTP: delete all messages for a user (batched)
-exports.adminDeleteMessagesForUser = functions.https.onRequest((req, res) => {
-  return cors(req, res, async () => {
+// Helper: fetch target user's role
+async function getTargetRole(targetUid) {
+  const snap = await db.collection("users").doc(targetUid).get();
+  return snap.exists ? snap.data().role : null;
+}
+
+/* ---------------------------
+   Toggle permanent ban (admin)
+   body: { targetUid: string, banned: boolean }
+   --------------------------- */
+exports.adminToggleBan = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
     try {
-      if (req.method !== "POST") return res.status(405).send("Use POST");
-      const { targetUid } = req.body || {};
-      if (!targetUid) return res.status(400).send("targetUid required");
+      const caller = await checkAuth(req, res, "admin");
+      const { targetUid, banned } = req.body;
+      if (!targetUid) throw new Error("Missing targetUid");
 
-      const callerUid = await getCallerUidFromReq(req);
-      const callerRole = await getUserRole(callerUid);
-      if (roleLevel(callerRole) < roleLevel("admin")) {
-        return res.status(403).send("Requires admin privileges");
+      const targetRole = await getTargetRole(targetUid);
+      // GrandWizard immunity: only GrandWizard can ban another GrandWizard
+      if (targetRole === 'GrandWizard' && caller.role !== 'GrandWizard') {
+        throw new Error("Cannot ban a GrandWizard");
       }
 
-      const batchSize = 500;
-      let totalDeleted = 0;
-      while (true) {
-        const q = db.collection("messages").where("uid", "==", targetUid).limit(batchSize);
-        const deleted = await deleteQueryBatch(q);
-        if (deleted === 0) break;
-        totalDeleted += deleted;
+      const updateObj = {
+        banned: !!banned,
+        // if unbanning, clear bannedUntil
+        bannedUntil: banned ? null : null,
+        banType: !!banned ? "permanent" : null
+      };
+
+      // If banned === false (unban) we want to clear bannedUntil; if banned === true we keep existing bannedUntil null (permanent)
+      if (banned === true) {
+        updateObj.banned = true;
+        updateObj.bannedUntil = null;
+        updateObj.banType = "permanent";
+      } else {
+        updateObj.banned = false;
+        updateObj.bannedUntil = null;
+        updateObj.banType = null;
       }
 
-      await db.collection("moderationLogs").add({
-        action: "deleteMessages",
-        targetUid,
-        by: callerUid,
-        deletedCount: totalDeleted,
-        ts: admin.firestore.FieldValue.serverTimestamp()
-      });
+      await db.collection("users").doc(targetUid).update(updateObj);
+      await moderationLog("toggleBan", targetUid, caller.uid, { banned: !!banned });
 
-      return res.json({ ok: true, deleted: totalDeleted });
+      res.json({ success: true, banned: !!banned });
     } catch (err) {
-      console.error("adminDeleteMessagesForUser err:", err);
-      return res.status(err.status || 500).send(err.message || String(err));
+      console.error("adminToggleBan error:", err);
+      res.status(403).json({ error: err.message || String(err) });
     }
   });
 });
 
-// HTTP: revoke refresh tokens (force logout) - GrandWizard only
-exports.adminRevokeTokens = functions.https.onRequest((req, res) => {
-  return cors(req, res, async () => {
+/* ---------------------------
+   Temp ban (admin)
+   body: { targetUid: string, durationMs: number }
+   Writes: banned: true, bannedUntil: Timestamp, banType: "temp"
+   --------------------------- */
+exports.adminTempBan = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
     try {
-      if (req.method !== "POST") return res.status(405).send("Use POST");
-      const { targetUid } = req.body || {};
-      if (!targetUid) return res.status(400).send("targetUid required");
+      const caller = await checkAuth(req, res, "admin");
+      const { targetUid, durationMs } = req.body;
+      if (!targetUid || !durationMs) throw new Error("Missing targetUid or durationMs");
 
-      const callerUid = await getCallerUidFromReq(req);
-      const callerRole = await getUserRole(callerUid);
-      if (roleLevel(callerRole) < roleLevel("GrandWizard")) {
-        return res.status(403).send("Requires GrandWizard privileges");
+      const targetRole = await getTargetRole(targetUid);
+      if (targetRole === 'GrandWizard' && caller.role !== 'GrandWizard') {
+        throw new Error("Cannot temp-ban a GrandWizard");
       }
+
+      const untilMillis = Date.now() + Number(durationMs);
+      const untilTs = admin.firestore.Timestamp.fromMillis(untilMillis);
+
+      await db.collection("users").doc(targetUid).update({
+        banned: true,
+        bannedUntil: untilTs,
+        banType: "temp"
+      });
+
+      await moderationLog("tempBan", targetUid, caller.uid, { durationMs: Number(durationMs), until: untilTs.toDate() });
+
+      res.json({ success: true, until: untilTs.toDate() });
+    } catch (err) {
+      console.error("adminTempBan error:", err);
+      res.status(403).json({ error: err.message || String(err) });
+    }
+  });
+});
+
+/* ---------------------------
+   Shadowban (admin)
+   body: { targetUid: string, shadowBanned: boolean }
+   --------------------------- */
+exports.adminShadowBan = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      const caller = await checkAuth(req, res, "admin");
+      const { targetUid, shadowBanned } = req.body;
+      if (!targetUid) throw new Error("Missing targetUid");
+
+      const targetRole = await getTargetRole(targetUid);
+      if (targetRole === 'GrandWizard' && caller.role !== 'GrandWizard') {
+        throw new Error("Cannot shadow-ban a GrandWizard");
+      }
+
+      await db.collection("users").doc(targetUid).update({ shadowBanned: !!shadowBanned });
+      await moderationLog("shadowBan", targetUid, caller.uid, { shadowBanned: !!shadowBanned });
+
+      res.json({ success: true, shadowBanned: !!shadowBanned });
+    } catch (err) {
+      console.error("adminShadowBan error:", err);
+      res.status(403).json({ error: err.message || String(err) });
+    }
+  });
+});
+
+/* ---------------------------
+   Revoke tokens (GrandWizard only)
+   body: { targetUid: string }
+   --------------------------- */
+exports.adminRevokeTokens = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      const caller = await checkAuth(req, res, "GrandWizard");
+      const { targetUid } = req.body;
+      if (!targetUid) throw new Error("Missing targetUid");
 
       await admin.auth().revokeRefreshTokens(targetUid);
-      await db.collection("moderationLogs").add({
-        action: "revokeTokens",
-        targetUid,
-        by: callerUid,
-        ts: admin.firestore.FieldValue.serverTimestamp()
-      });
+      await moderationLog("revokeTokens", targetUid, caller.uid);
 
-      return res.json({ ok: true });
+      res.json({ success: true });
     } catch (err) {
-      console.error("adminRevokeTokens err:", err);
-      return res.status(err.status || 500).send(err.message || String(err));
+      console.error("adminRevokeTokens error:", err);
+      res.status(403).json({ error: err.message || String(err) });
     }
   });
 });
 
-// HTTP: delete an Auth user (GrandWizard only) - remove messages, user doc, auth account
+/* ---------------------------
+   Delete all messages for a user (admin)
+   body: { targetUid: string }
+   --------------------------- */
+exports.adminDeleteMessagesForUser = functions.https.onRequest((req, res) => {
+  cors(req, res, async () => {
+    try {
+      const caller = await checkAuth(req, res, "admin");
+      const { targetUid } = req.body;
+      if (!targetUid) throw new Error("Missing targetUid");
+
+      // allow deleting messages even for GrandWizard (you might want to block, but leaving as admin privilege)
+      const snap = await db.collection("messages").where("uid", "==", targetUid).get();
+      const batch = db.batch();
+      snap.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+
+      await moderationLog("deleteMessages", targetUid, caller.uid, { deletedCount: snap.size });
+
+      res.json({ success: true, deleted: snap.size });
+    } catch (err) {
+      console.error("adminDeleteMessagesForUser error:", err);
+      res.status(403).json({ error: err.message || String(err) });
+    }
+  });
+});
+
+/* ---------------------------
+   Delete Auth user + firestore doc (GrandWizard only)
+   body: { targetUid: string }
+   --------------------------- */
 exports.adminDeleteAuthUser = functions.https.onRequest((req, res) => {
-  return cors(req, res, async () => {
+  cors(req, res, async () => {
     try {
-      if (req.method !== "POST") return res.status(405).send("Use POST");
-      const { targetUid } = req.body || {};
-      if (!targetUid) return res.status(400).send("targetUid required");
+      const caller = await checkAuth(req, res, "GrandWizard");
+      const { targetUid } = req.body;
+      if (!targetUid) throw new Error("Missing targetUid");
 
-      const callerUid = await getCallerUidFromReq(req);
-      const callerRole = await getUserRole(callerUid);
-      if (roleLevel(callerRole) < roleLevel("GrandWizard")) {
-        return res.status(403).send("Requires GrandWizard privileges");
-      }
-
-      // delete messages in batches
-      let totalDeleted = 0;
-      while (true) {
-        const q = db.collection("messages").where("uid", "==", targetUid).limit(500);
-        const deleted = await deleteQueryBatch(q);
-        if (deleted === 0) break;
-        totalDeleted += deleted;
-      }
-
-      // remove Firestore user doc (if exists)
-      await db.doc(`users/${targetUid}`).delete().catch(()=>{});
-
-      // delete auth user
-      await admin.auth().deleteUser(targetUid);
-
-      await db.collection("moderationLogs").add({
-        action: "deleteAuthUser",
-        targetUid,
-        by: callerUid,
-        deletedMessages: totalDeleted,
-        ts: admin.firestore.FieldValue.serverTimestamp()
+      // Delete auth user (if exists)
+      await admin.auth().deleteUser(targetUid).catch(err => {
+        console.warn("deleteUser warning:", err.message || err);
       });
 
-      return res.json({ ok: true, deletedMessages: totalDeleted });
+      // Delete Firestore user doc
+      await db.collection("users").doc(targetUid).delete().catch(e => console.warn("delete user doc warning:", e));
+
+      // Optionally delete messages
+      const snap = await db.collection("messages").where("uid", "==", targetUid).get();
+      const batch = db.batch();
+      snap.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+
+      await moderationLog("deleteAuthUser", targetUid, caller.uid, { removedMessages: snap.size });
+
+      res.json({ success: true });
     } catch (err) {
-      console.error("adminDeleteAuthUser err:", err);
-      return res.status(err.status || 500).send(err.message || String(err));
+      console.error("adminDeleteAuthUser error:", err);
+      res.status(403).json({ error: err.message || String(err) });
     }
   });
 });
-
-// Firestore trigger: on new message -> enforce banned/shadow behaviors
-exports.onMessageCreate = functions.firestore
-  .document("messages/{messageId}")
-  .onCreate(async (snap, ctx) => {
-    try {
-      const message = snap.data();
-      const uid = message.uid;
-      if (!uid) return null;
-
-      const userSnap = await db.doc(`users/${uid}`).get();
-      if (!userSnap.exists) return null;
-      const user = userSnap.data();
-
-      const now = admin.firestore.Timestamp.now();
-      const bannedBool = !!user.banned;
-      const bannedUntil = user.bannedUntil || null;
-      if (bannedBool || (bannedUntil && bannedUntil.toMillis && bannedUntil.toMillis() > now.toMillis())) {
-        // user is banned => delete message
-        await snap.ref.delete();
-        await db.collection("moderationLogs").add({
-          action: "deletedMessage_from_banned_user",
-          messageId: snap.id,
-          uid,
-          ts: admin.firestore.FieldValue.serverTimestamp()
-        });
-        return null;
-      }
-
-      // shadow ban => mark hidden so non-admins won't see
-      if (user.shadowBanned) {
-        await snap.ref.update({ hidden: true });
-        await db.collection("moderationLogs").add({
-          action: "shadowHideMessage",
-          messageId: snap.id,
-          uid,
-          ts: admin.firestore.FieldValue.serverTimestamp()
-        });
-        return null;
-      }
-
-      // otherwise ensure not hidden
-      if (snap.exists && snap.data().hidden) {
-        await snap.ref.update({ hidden: false }).catch(()=>{});
-      }
-      return null;
-    } catch (err) {
-      console.error("onMessageCreate error:", err);
-      return null;
-    }
-  });
