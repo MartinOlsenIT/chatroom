@@ -13,6 +13,11 @@
 * {
   box-sizing: border-box;
 }
+/* add into css/styles.css */
+.chat-bubble { margin: 8px 0; padding: 8px 10px; border-radius: 8px; background: rgba(255,255,255,0.03); }
+.chat-bubble.mine { background: linear-gradient(90deg,#006aff,#0084ff); color:#fff; align-self:flex-end; }
+.chat-header { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+.delete-btn, .report-btn { margin-left:8px; padding:4px 6px; border-radius:6px; border:none; cursor:pointer; background:rgba(255,255,255,0.03); color:#eee; }
 
 body {
   margin: 0;

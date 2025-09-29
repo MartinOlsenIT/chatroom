@@ -1,10 +1,12 @@
 <!doctype html>
 <html>
+
 <head>
   <meta charset="utf-8" />
   <title>My Profile</title>
   <link rel="stylesheet" href="css/styles.css">
 </head>
+
 <body class="profile-page">
   <div class="profile-container">
     <h2>My Profile</h2>
@@ -24,6 +26,18 @@
     const form = document.getElementById("profile-form");
     const usernameInput = document.getElementById("username");
     const bioInput = document.getElementById("bio");
+
+    const params = new URLSearchParams(window.location.search);
+    const viewUid = params.get("uid"); // if this exists, admin wants to view a profile
+    // in onAuthStateChanged, when fetching user data:
+    const loadingUid = viewUid || user.uid;
+    // then after fetching, if viewUid && viewUid !== user.uid -> disable inputs:
+    if (viewUid && viewUid !== user.uid) {
+      usernameInput.disabled = true;
+      bioInput.disabled = true;
+      form.querySelector("button[type=submit]").style.display = "none";
+    }
+
 
     onAuthStateChanged(auth, async (user) => {
       if (!user) return (window.location = "login.html");
@@ -53,4 +67,5 @@
     });
   </script>
 </body>
+
 </html>

@@ -7,57 +7,44 @@ import {
   updateProfile,
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-
 import { doc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-// ensure user profile exists in Firestore
-async function ensureUserDoc(user) {
-  if (!user) return;
-  const ref = doc(db, "users", user.uid);
-  const snap = await getDoc(ref);
-  if (!snap.exists()) {
-    await setDoc(ref, {
-      uid: user.uid,
-      email: user.email,
-      username: user.displayName || user.email,
-      bio: "",
-      role: "user",
-      banned: false,
-      createdAt: Date.now()
-    });
-    console.log("Created Firestore profile for", user.email);
-  }
-}
-
-// Signup
 export async function signup(email, password, username) {
   const cred = await createUserWithEmailAndPassword(auth, email, password);
   await updateProfile(cred.user, { displayName: username });
-  await ensureUserDoc(cred.user);
+  await setDoc(doc(db, "users", cred.user.uid), {
+    uid: cred.user.uid,
+    email: cred.user.email,
+    username,
+    bio: "",
+    role: "user",
+    banned: false,
+    mutedUntil: null,
+    shadowBanned: false,
+    forceRename: false,
+    createdAt: Date.now()
+  });
   return cred.user;
 }
 
-// Login
 export async function login(email, password) {
   const cred = await signInWithEmailAndPassword(auth, email, password);
-  await ensureUserDoc(cred.user);
   return cred.user;
 }
 
-// Logout
 export function logout() {
   return signOut(auth);
 }
 
-// Auth redirect
+// Global auth watcher: redirect logic is handled in chat/profile where needed
 onAuthStateChanged(auth, async (user) => {
   if (user) {
-    await ensureUserDoc(user);
+    // If on login page redirect to index
     if (window.location.pathname.endsWith("login.html")) {
       window.location = "index.html";
     }
   } else {
-    if (window.location.pathname.endsWith("index.html")) {
+    if (window.location.pathname.endsWith("index.html") || window.location.pathname.endsWith("admin.html") || window.location.pathname.endsWith("profile.html")) {
       window.location = "login.html";
     }
   }

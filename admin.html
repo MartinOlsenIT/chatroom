@@ -2,63 +2,345 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Admin Panel</title>
-  <link rel="stylesheet" href="css/styles.css">
+  <title>Admin Panel — Moderation Console</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="css/admin.css">
 </head>
 <body class="admin-page">
   <div class="admin-container">
-    <h2>Admin Panel</h2>
-    <button id="back">⬅ Back to Chat</button>
-    <div id="users-list"></div>
+    <header>
+      <div>
+        <h2>Admin Panel — Moderation Console</h2>
+        <div id="current-info" class="small">Loading...</div>
+      </div>
+      <div class="controls">
+        <button id="back" class="btn-ghost">⬅ Back to Chat</button>
+        <button id="tab-users" class="btn-ghost">Users</button>
+        <button id="tab-reports" class="btn-ghost">Reports</button>
+        <button id="refresh" class="btn-ghost">Refresh</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="users-section">
+        <h3 class="small">Users</h3>
+        <div id="users-list"></div>
+      </section>
+
+      <section id="reports-section" style="display:none;">
+        <h3 class="small">Reports</h3>
+        <div id="report-list"></div>
+      </section>
+    </main>
+
+    <footer>
+      Actions are audited to <code>moderationLogs</code>. Make sure your Cloud Functions are deployed and the project id in this file is correct.
+    </footer>
   </div>
 
   <script type="module">
     import { auth, db } from "./js/firebase-config.js";
-    import { collection, getDocs, updateDoc, doc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-    import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+    import {
+      collection, getDocs, updateDoc, doc, deleteDoc, query, where, getDoc, serverTimestamp, arrayUnion, addDoc
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import { onAuthStateChanged, sendPasswordResetEmail } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
-    document.getElementById("back").addEventListener("click", () => {
-      window.location = "index.html";
-    });
+    // Auto derive functions base from your project id
+    const projectId = "chatroom-3023e"; // <--- your project id
+    const region = "us-central1"; // change if you deployed functions to a different region
+    const FUNC_BASE = `https://${region}-${projectId}.cloudfunctions.net`;
+    const ENDPOINT_DELETE_AUTH = `${FUNC_BASE}/adminDeleteAuthUser`;
+    const ENDPOINT_REVOKE_TOKENS = `${FUNC_BASE}/adminRevokeTokens`;
+    const ENDPOINT_DELETE_MESSAGES = `${FUNC_BASE}/adminDeleteMessagesForUser`;
+
+    const usersList = document.getElementById("users-list");
+    const reportList = document.getElementById("report-list");
+    const currentInfo = document.getElementById("current-info");
+    const back = document.getElementById("back");
+    const refresh = document.getElementById("refresh");
+
+    const tabUsers = document.getElementById("tab-users");
+    const tabReports = document.getElementById("tab-reports");
+    const usersSection = document.getElementById("users-section");
+    const reportsSection = document.getElementById("reports-section");
+
+    back.addEventListener("click", () => window.location = "index.html");
+    refresh.addEventListener("click", () => { loadUsers(); loadReports(); });
+    tabUsers.addEventListener("click", ()=>{ usersSection.style.display='block'; reportsSection.style.display='none'; });
+    tabReports.addEventListener("click", ()=>{ usersSection.style.display='none'; reportsSection.style.display='block'; loadReports(); });
+
+    let currentUser = null;
+    let currentUserRole = "user";
+
+    const PERMISSIONS = {
+      GrandWizard: new Set(["deleteAuth","revokeTokens","deleteMessages","mute","warn","ban","tempBan","shadowBan","changeRole","deleteFirestore","exportData","adminNotes","forceRename"]),
+      admin: new Set(["deleteMessages","mute","warn","ban","tempBan","shadowBan","changeRole","deleteFirestore","exportData","adminNotes","forceRename"]),
+      moderator: new Set(["mute","warn","exportData","adminNotes"]),
+      user: new Set([])
+    };
+
+    function canDo(action){
+      const perms = PERMISSIONS[currentUserRole] || new Set();
+      return perms.has(action) || currentUserRole === 'GrandWizard';
+    }
+
+    async function loadUsers(){
+      usersList.innerHTML = "Loading users...";
+      const snaps = await getDocs(collection(db,"users"));
+      usersList.innerHTML = "";
+      for (const s of snaps.docs) {
+        renderUserRow(s.id, s.data());
+      }
+    }
+
+    function roleSelect(cur){
+      const sel = document.createElement("select");
+      ["user","moderator","admin","GrandWizard"].forEach(r => {
+        const o = document.createElement("option"); o.value = r; o.textContent = r; if (r===cur) o.selected=true; sel.appendChild(o);
+      });
+      return sel;
+    }
+
+    function escapeHtml(s){ if(!s) return ''; return String(s).replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c])); }
+
+    async function renderUserRow(uid, data){
+      const row = document.createElement("div");
+      row.className = "admin-user-row";
+      const isTempBanned = data.bannedUntil && (data.bannedUntil.toDate ? data.bannedUntil.toDate() : new Date(data.bannedUntil)) > new Date();
+      if (data.banned || isTempBanned) row.classList.add("muted");
+
+      const left = document.createElement("div"); left.className = "user-left";
+      left.innerHTML = `<div class="title">${escapeHtml(data.username||'(no username)')} <span class="small">${escapeHtml(data.email||'')}</span></div>
+                        <div class="user-meta">Role: <em>${data.role||'user'}</em> • Banned: ${data.banned ? 'yes' : 'no'}${isTempBanned ? ' • until: '+ (data.bannedUntil.toDate ? data.bannedUntil.toDate() : new Date(data.bannedUntil)) : ''}</div>`;
+
+      const actions = document.createElement("div"); actions.className = "admin-actions";
+
+      // role select
+      const sel = roleSelect(data.role||'user');
+      sel.addEventListener("change", async (e) => {
+        if (!canDo("changeRole")) return alert("Not authorized");
+        const newRole = e.target.value;
+        await updateDoc(doc(db,"users",uid),{ role: newRole });
+        await audit('changeRole', uid, { to: newRole });
+        loadUsers();
+      });
+      actions.appendChild(sel);
+
+      // reset password
+      const reset = document.createElement("button"); reset.textContent = "Reset Password";
+      reset.addEventListener("click", async ()=> {
+        if (!data.email) return alert("No email");
+        try { await sendPasswordResetEmail(auth, data.email); alert("Reset sent"); } catch(e){ alert("Error: "+e.message); }
+      }); actions.appendChild(reset);
+
+      // view profile
+      const view = document.createElement("button"); view.textContent = "View Profile";
+      view.addEventListener("click", ()=> window.location = `profile.html?uid=${uid}`);
+      actions.appendChild(view);
+
+      // delete messages (server)
+      const delMsgs = document.createElement("button"); delMsgs.textContent = "Delete Messages";
+      delMsgs.addEventListener("click", async () => {
+        if (!canDo("deleteMessages")) return alert("Not authorized");
+        if (!confirm("Delete ALL messages for this user?")) return;
+        try {
+          const token = await auth.currentUser.getIdToken(true);
+          const res = await fetch(ENDPOINT_DELETE_MESSAGES, { method: "POST", headers: { "Content-Type":"application/json", Authorization: "Bearer "+token }, body: JSON.stringify({ targetUid: uid })});
+          if (!res.ok) throw new Error(await res.text());
+          await audit('deleteMessages', uid);
+          alert("Messages deleted.");
+          loadUsers();
+        } catch (err) { alert("Error: "+(err.message||err)); }
+      });
+      actions.appendChild(delMsgs);
+
+      // mute toggle
+      const muteBtn = document.createElement("button"); muteBtn.textContent = data.mutedUntil ? "Unmute" : "Mute 1h";
+      muteBtn.addEventListener("click", async () => {
+        if (!canDo("mute")) return alert("Not authorized");
+        const ref = doc(db,"users",uid);
+        if (data.mutedUntil) { await updateDoc(ref,{ mutedUntil: null }); await audit('unmute', uid); }
+        else { const until = new Date(Date.now() + 60*60*1000); await updateDoc(ref,{ mutedUntil: until }); await audit('mute', uid, { until }); }
+        loadUsers();
+      });
+      actions.appendChild(muteBtn);
+
+      // warn
+      const warnInput = document.createElement("input"); warnInput.placeholder = "Warning message";
+      const warnBtn = document.createElement("button"); warnBtn.textContent = "Warn";
+      warnBtn.addEventListener("click", async () => {
+        if (!canDo("warn")) return alert("Not authorized");
+        const text = warnInput.value.trim(); if (!text) return alert("Enter warning text");
+        await updateDoc(doc(db,"users",uid), { warnings: arrayUnion({ text, createdAt: serverTimestamp(), by: auth.currentUser.uid })});
+        await audit('warn', uid, { text });
+        warnInput.value = "";
+        alert("Warning added");
+      });
+      actions.appendChild(warnInput); actions.appendChild(warnBtn);
+
+      // ban/unban
+      const banBtn = document.createElement("button"); banBtn.textContent = data.banned ? "Unban" : "Ban";
+      banBtn.addEventListener("click", async () => {
+        if (!canDo("ban")) return alert("Not authorized");
+        await updateDoc(doc(db,"users",uid),{ banned: !data.banned });
+        await audit(data.banned ? 'unban' : 'ban', uid);
+        loadUsers();
+      });
+      actions.appendChild(banBtn);
+
+      // temp ban 24h
+      const tempBtn = document.createElement("button"); tempBtn.textContent = "Temp Ban 24h";
+      tempBtn.addEventListener("click", async () => {
+        if (!canDo("tempBan")) return alert("Not authorized");
+        const until = new Date(Date.now() + 24*60*60*1000);
+        await updateDoc(doc(db,"users",uid), { bannedUntil: until });
+        await audit('tempBan', uid, { until });
+        loadUsers();
+      });
+      actions.appendChild(tempBtn);
+
+      // shadow ban
+      const shadowBtn = document.createElement("button"); shadowBtn.textContent = data.shadowBanned ? "Unshadow Ban" : "Shadow Ban";
+      shadowBtn.addEventListener("click", async () => {
+        if (!canDo("shadowBan")) return alert("Not authorized");
+        await updateDoc(doc(db,"users",uid), { shadowBanned: !data.shadowBanned });
+        await audit('shadowBan', uid);
+        loadUsers();
+      });
+      actions.appendChild(shadowBtn);
+
+      // force rename
+      const forceBtn = document.createElement("button"); forceBtn.textContent = "Force Rename";
+      forceBtn.addEventListener("click", async () => {
+        if (!canDo("forceRename")) return alert("Not authorized");
+        await updateDoc(doc(db,"users",uid), { forceRename: true });
+        await audit('forceRename', uid);
+        alert("User will be asked to rename next session");
+      });
+      actions.appendChild(forceBtn);
+
+      // export data (messages)
+      const exportBtn = document.createElement("button"); exportBtn.textContent = "Export Data";
+      exportBtn.addEventListener("click", async () => {
+        if (!canDo("exportData")) return alert("Not authorized");
+        const msgsSnap = await getDocs(query(collection(db,"messages"), where("uid","==",uid)));
+        const data = msgsSnap.docs.map(d => d.data());
+        const blob = new Blob([JSON.stringify(data,null,2)], { type: "application/json" });
+        const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `${uid}-messages.json`; a.click();
+        await audit('exportData', uid);
+      });
+      actions.appendChild(exportBtn);
+
+      // admin notes
+      const noteInput = document.createElement("input"); noteInput.placeholder = "Add admin note";
+      const noteBtn = document.createElement("button"); noteBtn.textContent = "Add Note";
+      noteBtn.addEventListener("click", async () => {
+        if (!canDo("adminNotes")) return alert("Not authorized");
+        const text = noteInput.value.trim(); if (!text) return alert("Enter note");
+        await updateDoc(doc(db,"users",uid), { adminNotes: arrayUnion({ text, createdAt: serverTimestamp(), by: auth.currentUser.uid })});
+        await audit('adminNote', uid, { text });
+        noteInput.value = "";
+        alert("Note added");
+      });
+      actions.appendChild(noteInput); actions.appendChild(noteBtn);
+
+      // delete Firestore doc (not auth)
+      const delFs = document.createElement("button"); delFs.textContent = "Delete Firestore Data"; delFs.className = "btn-danger";
+      delFs.addEventListener("click", async () => {
+        if (!canDo("deleteFirestore")) return alert("Not authorized");
+        if (!confirm("Delete Firestore user doc? (Auth account remains)")) return;
+        await deleteDoc(doc(db,"users",uid));
+        await audit('deleteFirestore', uid);
+        alert("Deleted Firestore doc");
+        loadUsers();
+      });
+      actions.appendChild(delFs);
+
+      // super actions (GrandWizard only)
+      if (currentUserRole === "GrandWizard") {
+        const superArea = document.createElement("div"); superArea.className = "super-section";
+        const delAuth = document.createElement("button"); delAuth.textContent = "DELETE Auth Account"; delAuth.className = "btn-danger";
+        delAuth.addEventListener("click", async () => {
+          if (!confirm("Permanently delete Auth account?")) return;
+          try {
+            const token = await auth.currentUser.getIdToken(true);
+            const res = await fetch(ENDPOINT_DELETE_AUTH, { method: "POST", headers: { "Content-Type":"application/json", Authorization: "Bearer "+token }, body: JSON.stringify({ targetUid: uid })});
+            if (!res.ok) throw new Error(await res.text());
+            await audit('deleteAuth', uid);
+            alert("Requested deletion");
+            loadUsers();
+          } catch (e) { alert("Error: "+(e.message||e)); }
+        });
+        superArea.appendChild(delAuth);
+
+        const revoke = document.createElement("button"); revoke.textContent = "Force Logout (Revoke Tokens)";
+        revoke.addEventListener("click", async () => {
+          if (!confirm("Force logout?")) return;
+          try {
+            const token = await auth.currentUser.getIdToken(true);
+            const res = await fetch(ENDPOINT_REVOKE_TOKENS, { method: "POST", headers: { "Content-Type":"application/json", Authorization: "Bearer "+token }, body: JSON.stringify({ targetUid: uid })});
+            if (!res.ok) throw new Error(await res.text());
+            await audit('revokeTokens', uid);
+            alert("Revoked");
+          } catch (e) { alert("Error: "+(e.message||e)); }
+        });
+        superArea.appendChild(revoke);
+        actions.appendChild(superArea);
+      }
+
+      row.appendChild(left);
+      row.appendChild(actions);
+      usersList.appendChild(row);
+    }
+
+    // Reports functions
+    async function loadReports(){
+      reportList.innerHTML = "Loading reports...";
+      const snaps = await getDocs(query(collection(db,"reports"), where("status","==","open")));
+      reportList.innerHTML = "";
+      for (const s of snaps.docs){
+        const r = s.data();
+        const container = document.createElement("div"); container.className = "admin-user-row";
+        const left = document.createElement("div"); left.className = "user-left";
+        left.innerHTML = `<div class="title">Report for message <code>${escapeHtml(r.messageId)}</code></div><div class="user-meta">Offender: ${escapeHtml(r.uid)} • Reporter: ${escapeHtml(r.reporter)} • ${r.ts ? new Date(r.ts.seconds*1000).toLocaleString() : ''}</div>`;
+        const actions = document.createElement("div"); actions.className = "admin-actions";
+
+        const dismissBtn = document.createElement("button"); dismissBtn.textContent = "Dismiss";
+        dismissBtn.addEventListener("click", async () => { await updateDoc(doc(db,"reports",s.id),{ status: "dismissed" }); await audit('dismissReport', r.uid); loadReports(); });
+        const deleteMsgBtn = document.createElement("button"); deleteMsgBtn.textContent = "Delete Msg";
+        deleteMsgBtn.addEventListener("click", async () => {
+          try { await deleteDoc(doc(db,"messages", r.messageId)); await updateDoc(doc(db,"reports", s.id), { status: "resolved" }); await audit('deleteMsgViaReport', r.uid); loadReports(); } catch(e){ alert("Error: "+e.message); }
+        });
+        const banBtn = document.createElement("button"); banBtn.textContent = "Ban User";
+        banBtn.addEventListener("click", async () => { await updateDoc(doc(db,"users", r.uid), { banned: true }); await updateDoc(doc(db,"reports", s.id), { status: "resolved" }); await audit('banUserViaReport', r.uid); loadReports(); });
+
+        actions.appendChild(dismissBtn); actions.appendChild(deleteMsgBtn); actions.appendChild(banBtn);
+        container.appendChild(left); container.appendChild(actions);
+        reportList.appendChild(container);
+      }
+      if ((await getDocs(query(collection(db,"reports"), where("status","==","open")))).empty) {
+        reportList.innerHTML = "<div class='small'>No open reports</div>";
+      }
+    }
+
+    async function audit(action, targetUid, meta = {}){
+      try { await addDoc(collection(db,"moderationLogs"), { action, targetUid, by: auth.currentUser.uid, ts: serverTimestamp(), meta }); } catch(e){ console.error("audit failed", e); }
+    }
 
     onAuthStateChanged(auth, async (user) => {
-      if (!user) return (window.location = "login.html");
-
-      const usersCol = collection(db, "users");
-      const snap = await getDocs(usersCol);
-
-      const list = document.getElementById("users-list");
-      list.innerHTML = "";
-
-      snap.forEach((docSnap) => {
-        const data = docSnap.data();
-        const row = document.createElement("div");
-        row.className = "admin-user-row";
-        row.innerHTML = `
-          <div>
-            <strong>${data.username}</strong> (${data.email})<br/>
-            Role: ${data.role} | Banned: ${data.banned}
-          </div>
-          <div>
-            <button class="make-admin">Make Admin</button>
-            <button class="toggle-ban">${data.banned ? "Unban" : "Ban"}</button>
-          </div>
-        `;
-
-        row.querySelector(".make-admin").addEventListener("click", async () => {
-          await updateDoc(doc(db, "users", data.uid), { role: "admin" });
-          alert(`${data.username} is now admin!`);
-          window.location.reload();
-        });
-
-        row.querySelector(".toggle-ban").addEventListener("click", async () => {
-          await updateDoc(doc(db, "users", data.uid), { banned: !data.banned });
-          alert(`${data.username} ban status changed!`);
-          window.location.reload();
-        });
-
-        list.appendChild(row);
-      });
+      if (!user) return window.location = "login.html";
+      currentUser = user;
+      const meSnap = await getDoc(doc(db,"users", user.uid));
+      const meData = meSnap.exists() ? meSnap.data() : {};
+      currentUserRole = meData.role || "user";
+      currentInfo.textContent = `You: ${meData.username||user.email} • Role: ${currentUserRole}`;
+      if (!(currentUserRole === "admin" || currentUserRole === "GrandWizard" || currentUserRole === "moderator")) {
+        alert("You are not an admin.");
+        window.location = "index.html";
+        return;
+      }
+      await loadUsers();
+      await loadReports();
     });
   </script>
 </body>
